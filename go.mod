@@ -15,6 +15,7 @@ require (
 	github.com/pganalyze/pg_query_go/v2 v2.0.2
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.3
+	golang.org/x/sys v0.5.0 // indirect
 	golang.org/x/text v0.3.5 // indirect
 	google.golang.org/appengine v1.6.1 // indirect
 	google.golang.org/grpc v1.36.0
