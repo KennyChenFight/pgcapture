@@ -78,8 +78,14 @@ sql_command_tags(PG_FUNCTION_ARGS)
 #else
         commandTag         = CreateCommandTag(parsetree);
 #endif
-        astate             = accumArrayResult(astate, CStringGetTextDatum(commandTag),
-                             false, TEXTOID, CurrentMemoryContext);
+        // Skip DML commandTags
+        if (strcmp(commandTag, "INSERT") != 0 &&
+            strcmp(commandTag, "UPDATE") != 0 &&
+            strcmp(commandTag, "DELETE") != 0)
+        {
+            astate = accumArrayResult(astate, CStringGetTextDatum(commandTag),
+                                      false, TEXTOID, CurrentMemoryContext);
+        }
     }
     if (astate == NULL)
                 elog(ERROR, "Invalid sql command");
