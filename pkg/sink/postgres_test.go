@@ -201,21 +201,21 @@ func TestPGXSink(t *testing.T) {
 	doTx([]*pb.Change{{
 		Op:     pb.Change_INSERT,
 		Schema: "public",
-		Table:  "t5",
+		Table:  "t6",
 		New: []*pb.Field{
-			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 1, 0}}},
-			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 1, 0}}},
+			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
 			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
 		},
 	}, {
 		Op:     pb.Change_INSERT,
 		Schema: decode.ExtensionSchema,
 		Table:  decode.ExtensionDDLLogs,
-		New:    []*pb.Field{{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`insert into t5 (f1, f2, f3) values (2, 2, 'A');create table t6 (f1 int, f2 int, f3 text, primary key(f1, f2));insert into t6 (f1, f2, f3) values (1, 1, 'A');`)}}, {Name: "tags", Value: &pb.Field_Binary{Binary: tags("INSERT", "CREATE TABLE", "INSERT")}}},
+		New:    []*pb.Field{{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`insert into t6 (f1, f2, f3) values (1, 1, 'A');create table t7 (f1 int, f2 int, f3 text, primary key(f1, f2));insert into t7 (f1, f2, f3) values (1, 1, 'A');`)}}, {Name: "tags", Value: &pb.Field_Binary{Binary: tags("INSERT", "CREATE TABLE", "INSERT")}}},
 	}, {
 		Op:     pb.Change_INSERT,
 		Schema: "public",
-		Table:  "t6",
+		Table:  "t7",
 		New: []*pb.Field{
 			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
 			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
