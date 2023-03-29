@@ -162,6 +162,23 @@ func TestPGXSink(t *testing.T) {
 		},
 	}})
 
+	// handle create table with insert case
+	doTx([]*pb.Change{{
+		Op:     pb.Change_INSERT,
+		Schema: decode.ExtensionSchema,
+		Table:  decode.ExtensionDDLLogs,
+		New:    []*pb.Field{{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`create table t4 (f1 int, f2 int, f3 text, primary key(f1, f2)); insert into t4 (f1, f2, f3) values (1, 1, 'A');`)}}, {Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE", "INSERT")}}},
+	}, {
+		Op:     pb.Change_INSERT,
+		Schema: "public",
+		Table:  "t4",
+		New: []*pb.Field{
+			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
+		},
+	}})
+
 	doTx([]*pb.Change{{
 		Op:     pb.Change_DELETE,
 		Schema: "public",

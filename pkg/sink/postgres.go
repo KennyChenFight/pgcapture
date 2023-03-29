@@ -308,14 +308,13 @@ parse:
 	}
 
 	var stmts []*pg_query.RawStmt
-	// remove preceding dml commands, they were already present in previous change messages
 	// remove refresh materialized view stmt, otherwise they will block logical replication
-	preceding := true
+	// remove DML stmts because they should come from logical replication
 	for _, stmt := range tree.Stmts {
-		preceding = preceding && (stmt.Stmt.GetInsertStmt() != nil || stmt.Stmt.GetUpdateStmt() != nil || stmt.Stmt.GetDeleteStmt() != nil)
-		if preceding || stmt.Stmt.GetRefreshMatViewStmt() != nil {
+		if stmt.Stmt.GetRefreshMatViewStmt() != nil || stmt.Stmt.GetInsertStmt() != nil || stmt.Stmt.GetUpdateStmt() != nil || stmt.Stmt.GetDeleteStmt() != nil {
 			continue
 		}
+		fmt.Println("stmt:", stmt.Stmt.String())
 		stmts = append(stmts, stmt)
 	}
 
@@ -324,12 +323,6 @@ parse:
 	for _, stmt := range stmts {
 		var relation *pg_query.RangeVar
 		switch node := stmt.Stmt.Node.(type) {
-		case *pg_query.Node_InsertStmt:
-			relation = node.InsertStmt.Relation
-		case *pg_query.Node_UpdateStmt:
-			relation = node.UpdateStmt.Relation
-		case *pg_query.Node_DeleteStmt:
-			relation = node.DeleteStmt.Relation
 		case *pg_query.Node_CreateTableAsStmt:
 			relation = node.CreateTableAsStmt.Into.Rel
 		case *pg_query.Node_SelectStmt:
