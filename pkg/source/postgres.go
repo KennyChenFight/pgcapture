@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -165,13 +166,16 @@ func (p *PGXSource) fetching(ctx context.Context) (change Change, err error) {
 				return change, err
 			}
 			m, err := p.decoder.Decode(xld.WALData)
+			fmt.Println("m:", m)
 			if m == nil || err != nil {
 				return change, err
 			}
 			if msg := m.GetChange(); msg != nil {
+				fmt.Println("msg:", msg.New)
 				if decode.Ignore(msg) {
 					return change, nil
 				} else if decode.IsDDL(msg) {
+					fmt.Println("isDDL")
 					if err = p.schema.RefreshType(); err != nil {
 						return change, err
 					}

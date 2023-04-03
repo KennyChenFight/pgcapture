@@ -56,6 +56,7 @@ func (p *PGLogicalDecoder) Decode(in []byte) (m *pb.Message, err error) {
 		err = ReadRelation(in, &r)
 		p.relations[r.Rel] = r
 	case 'I', 'U', 'D':
+		fmt.Println("INSERT")
 		r := RowChange{}
 		if err = ReadRowChange(in, &r); err != nil {
 			return nil, err
@@ -66,6 +67,8 @@ func (p *PGLogicalDecoder) Decode(in []byte) (m *pb.Message, err error) {
 			return nil, errors.New("relation not found")
 		}
 
+		fmt.Println("r.Old", r.Old)
+		fmt.Println("r.New", r.New)
 		c := &pb.Change{Schema: rel.NspName, Table: rel.RelName, Op: OpMap[in[0]]}
 		c.Old = p.makePBTuple(rel, r.Old, true)
 		c.New = p.makePBTuple(rel, r.New, false)
@@ -90,9 +93,11 @@ func (p *PGLogicalDecoder) makePBTuple(rel Relation, src []Field, noNull bool) (
 		}
 		oid, err := p.schema.GetTypeOID(rel.NspName, rel.RelName, rel.Fields[i])
 		if err != nil {
+			fmt.Println("GetTypeOIDErr:", err)
 			// TODO: add optional logging, because it will generate a lot of logs when refreshing materialized view
 			continue
 		}
+		fmt.Println("oid:", oid)
 		switch s.Format {
 		case 'b':
 			fields = append(fields, &pb.Field{Name: rel.Fields[i], Oid: oid, Value: &pb.Field_Binary{Binary: s.Datum}})

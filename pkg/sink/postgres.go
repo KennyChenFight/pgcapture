@@ -210,8 +210,10 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 				}).Warn("receive incomplete transaction: change")
 				break
 			}
+			fmt.Println("msg:", msg.Change.New)
 			if decode.IsDDL(msg.Change) {
 				err = p.handleDDL(msg.Change)
+				fmt.Println("err:", err)
 			} else {
 				if len(p.skip) != 0 && p.skip[fmt.Sprintf("%s.%s", msg.Change.Schema, msg.Change.Table)] {
 					p.log.WithFields(logrus.Fields{
@@ -278,6 +280,7 @@ func (p *PGXSink) handleDDL(m *pb.Change) (err error) {
 	if err != nil {
 		return err
 	}
+	fmt.Println("command: ", command)
 	if count == 0 {
 		return nil
 	}
@@ -337,6 +340,7 @@ parse:
 				relation = node.SelectStmt.IntoClause.Rel
 			}
 		}
+		fmt.Println("relation:", relation)
 		if relation == nil {
 			continue
 		}

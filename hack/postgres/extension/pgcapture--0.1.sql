@@ -28,12 +28,12 @@ end;
 $$ LANGUAGE plpgsql STRICT;
 
 CREATE EVENT TRIGGER pgcapture_ddl_command_start ON ddl_command_start WHEN tag IN (
-    'CREATE TABLE AS',
     'SELECT INTO',
     'DROP TRIGGER',
     'DROP FUNCTION'
 ) EXECUTE PROCEDURE pgcapture.log_ddl();
 CREATE EVENT TRIGGER pgcapture_ddl_command_end ON ddl_command_end WHEN TAG IN (
+    'CREATE TABLE AS',
     'ALTER AGGREGATE',
     'ALTER COLLATION',
     'ALTER CONVERSION',
