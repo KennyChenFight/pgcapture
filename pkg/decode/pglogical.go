@@ -45,6 +45,7 @@ type PGLogicalDecoder struct {
 	log       *logrus.Entry
 }
 
+// https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html
 func (p *PGLogicalDecoder) Decode(in []byte) (m *pb.Message, err error) {
 	switch in[0] {
 	case 'B':
@@ -52,24 +53,25 @@ func (p *PGLogicalDecoder) Decode(in []byte) (m *pb.Message, err error) {
 	case 'C':
 		return ReadCommit(in)
 	case 'R':
+		// 當 schema 有 change 的話，就會送對應的 relation
 		r := Relation{}
 		err = ReadRelation(in, &r)
 		p.relations[r.Rel] = r
+	// insert, update, delete change decode
 	case 'I', 'U', 'D':
-		fmt.Println("INSERT")
 		r := RowChange{}
 		if err = ReadRowChange(in, &r); err != nil {
 			return nil, err
 		}
 
+		// 確認 relation 存在
 		rel, ok := p.relations[r.Rel]
 		if !ok {
 			return nil, errors.New("relation not found")
 		}
 
-		fmt.Println("r.Old", r.Old)
-		fmt.Println("r.New", r.New)
 		c := &pb.Change{Schema: rel.NspName, Table: rel.RelName, Op: OpMap[in[0]]}
+		// collect old & new tuple 資訊
 		c.Old = p.makePBTuple(rel, r.Old, true)
 		c.New = p.makePBTuple(rel, r.New, false)
 
@@ -91,18 +93,20 @@ func (p *PGLogicalDecoder) makePBTuple(rel Relation, src []Field, noNull bool) (
 		if noNull && s.Datum == nil {
 			continue
 		}
+		// 拿取對應 column 的 attribute oid
 		oid, err := p.schema.GetTypeOID(rel.NspName, rel.RelName, rel.Fields[i])
 		if err != nil {
-			fmt.Println("GetTypeOIDErr:", err)
 			// TODO: add optional logging, because it will generate a lot of logs when refreshing materialized view
 			continue
 		}
-		fmt.Println("oid:", oid)
 		switch s.Format {
+		// binary format
 		case 'b':
 			fields = append(fields, &pb.Field{Name: rel.Fields[i], Oid: oid, Value: &pb.Field_Binary{Binary: s.Datum}})
+		// null value
 		case 'n':
 			fields = append(fields, &pb.Field{Name: rel.Fields[i], Oid: oid, Value: nil})
+		// text format
 		case 't':
 			fields = append(fields, &pb.Field{Name: rel.Fields[i], Oid: oid, Value: &pb.Field_Text{Text: string(s.Datum)}})
 		case 'u':
@@ -168,8 +172,11 @@ func ReadRowChange(in []byte, m *RowChange) (err error) {
 	m.Rel, err = reader.Uint32()
 
 	kind, err := reader.Byte()
+	// 'N' 代表是 new tuple 資訊
 	if kind != 'N' {
+		// 讀取 old tuple 資訊
 		m.Old, err = readTuple(reader)
+		// update operation
 		if m.Op == 'U' {
 			kind, err = reader.Byte()
 		}
@@ -194,10 +201,14 @@ func readTuple(reader *BytesReader) (fields []Field, err error) {
 			return nil, err
 		}
 		switch fields[i].Format {
+		// binary format
 		case 'b':
 			fields[i].Datum, err = reader.Bytes32()
+		// n -> null value
+		// u -> unchanged toast value
 		case 'n', 'u':
 			continue
+		// text format
 		case 't':
 			fields[i].Datum, err = reader.Bytes32()
 			fields[i].Datum = bytes.TrimSuffix(fields[i].Datum, StringEnd)

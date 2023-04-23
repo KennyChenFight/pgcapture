@@ -49,6 +49,8 @@ func (p *PulsarSink) Setup() (cp cursor.Checkpoint, err error) {
 	}
 
 	if p.SetupTracker == nil {
+		// default tracker 使用 pulsar reader
+		// 另外一種 tracker 使用 pulsar consumer 因為原本的 reader 對 geo replication 的 snapshot message 讀取會有問題
 		p.SetupTracker = setupDefaultTracker
 	}
 
@@ -71,6 +73,7 @@ func (p *PulsarSink) Setup() (cp cursor.Checkpoint, err error) {
 		return cp, err
 	}
 
+	// 找到最新的 message
 	cp, err = p.tracker.Last()
 	if err != nil {
 		return cp, err
@@ -111,6 +114,9 @@ func (p *PulsarSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 			first = true
 		}
 
+		// 當 source restart 時，因為 PG 的特性，begin ~ commit 之間的 LSN 都相同
+		// 因此當如果 source shutdown 在之間的 change 的話，就需要透過 LSN 與 seq 來比大小
+		// 直到 consistent
 		p.consistent = p.consistent || change.Checkpoint.After(p.prev)
 		if !p.consistent {
 			p.log.WithFields(logrus.Fields{
@@ -129,6 +135,8 @@ func (p *PulsarSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 			return err
 		}
 
+		// key 由 LSN + seq 組成
+		// payload 則是 change 裡面 message
 		p.producer.SendAsync(context.Background(), &pulsar.ProducerMessage{
 			Key:                 change.Checkpoint.ToKey(), // for topic compaction, not routing policy
 			Payload:             bs,

@@ -47,9 +47,11 @@ func (p *PulsarReaderSource) Capture(cp cursor.Checkpoint) (changes chan Change,
 
 	start := pulsar.EarliestMessageID()
 	seekTs := time.Time{}
+	// 利用 message id 來定位
 	if id, err := pulsar.DeserializeMessageID(cp.Data); err == nil {
 		start = id
 	} else {
+		// 使用 pg 的 transaction time 來作為 seek time
 		if ts, err := time.Parse(time.RFC3339Nano, string(cp.Data)); err == nil {
 			seekTs = ts.Add(p.seekOffset)
 		}
@@ -67,6 +69,7 @@ func (p *PulsarReaderSource) Capture(cp cursor.Checkpoint) (changes chan Change,
 	}
 
 	if !seekTs.IsZero() {
+		// 透過時間來定位不會到很準確，還需要比較 LSN
 		if err = p.reader.SeekByTime(seekTs); err != nil {
 			return nil, err
 		}
@@ -91,6 +94,7 @@ func (p *PulsarReaderSource) Capture(cp cursor.Checkpoint) (changes chan Change,
 			return
 		}
 
+		// 將 message id 放入 checkpoint.Data 裡面
 		checkpoint, err := cursor.ToCheckpoint(msg)
 		if err != nil {
 			return
@@ -111,6 +115,7 @@ func (p *PulsarReaderSource) Capture(cp cursor.Checkpoint) (changes chan Change,
 			first = true
 		}
 
+		// 定位到指定的 LSN，直到 checkpoint.LSN <= cp.LSN
 		if !p.consistent && cp.LSN != 0 {
 			p.log.WithFields(logrus.Fields{
 				"MessageLSN":    checkpoint.LSN,

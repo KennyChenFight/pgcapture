@@ -3,7 +3,6 @@ package source
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -58,6 +57,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 	}
 
 	var sv string
+	// 撈取 server version 是為了給 pglogical plugin 參數做使用
 	if err = p.setupConn.QueryRow(ctx, sql.ServerVersionNum).Scan(&sv); err != nil {
 		return nil, err
 	}
@@ -67,18 +67,22 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 		return nil, err
 	}
 
+	// install pgcapture extension
 	if _, err = p.setupConn.Exec(ctx, sql.InstallExtension); err != nil {
 		return nil, err
 	}
 
+	// cache 特定 schema 下的所有 table 的全部欄位型態 oid 等資料
 	p.schema = decode.NewPGXSchemaLoader(p.setupConn)
 	if err = p.schema.RefreshType(); err != nil {
 		return nil, err
 	}
 
+	// 設定 logical decode plugin -> 目前只有 pglogical_output
 	p.decoder = decode.NewPGLogicalDecoder(p.schema)
 
 	if p.CreateSlot {
+		// create logical replication slot
 		if _, err = p.setupConn.Exec(ctx, sql.CreateLogicalSlot, p.ReplSlot, decode.OutputPlugin); err != nil {
 			if pge, ok := err.(*pgconn.PgError); !ok || pge.Code != "42710" {
 				return nil, err
@@ -91,6 +95,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 		return nil, err
 	}
 
+	// 確認 replica 與 primary 的關係
 	ident, err := pglogrepl.IdentifySystem(context.Background(), p.replConn)
 	if err != nil {
 		return nil, err
@@ -104,6 +109,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 		"DBName":   ident.DBName,
 	}).Info("retrieved current info of source database")
 
+	// 從 sink 最新的 LSN 開始從 primary 撈取資料
 	if cp.LSN != 0 {
 		p.currentLsn = cp.LSN
 		p.currentSeq = cp.Seq
@@ -112,6 +118,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 			"FromLSN":  p.currentLsn,
 		}).Info("start logical replication from requested position")
 	} else {
+		// 設定指令的 LSN
 		if p.StartLSN != "" {
 			startLsn, err := pglogrepl.ParseLSN(p.StartLSN)
 			if err != nil {
@@ -119,6 +126,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 			}
 			p.currentLsn = uint64(startLsn)
 		} else {
+			// 預設使用 source 當前最新的 flush LSN (logical replication slot)
 			p.currentLsn = uint64(ident.XLogPos)
 		}
 		p.currentSeq = 0
@@ -127,6 +135,7 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 			"FromLSN":  p.currentLsn,
 		}).Info("start logical replication from the latest position")
 	}
+	// 儲存當前 source 使用的 LSN
 	p.Commit(cursor.Checkpoint{LSN: p.currentLsn})
 	if err = pglogrepl.StartReplication(
 		context.Background(),
@@ -142,6 +151,8 @@ func (p *PGXSource) Capture(cp cursor.Checkpoint) (changes chan Change, err erro
 }
 
 func (p *PGXSource) fetching(ctx context.Context) (change Change, err error) {
+	// 每隔五秒鐘要對 source 進行 report LSN
+	// 對於 PG 而言，收到對應的 report LSN，代表 replica 已經不需要 report LSN 之前的資料了
 	if time.Now().After(p.nextReportTime) {
 		if err = p.reportLSN(ctx); err != nil {
 			return change, err
@@ -155,31 +166,37 @@ func (p *PGXSource) fetching(ctx context.Context) (change Change, err error) {
 	switch msg := msg.(type) {
 	case *pgproto3.CopyData:
 		switch msg.Data[0] {
+		// 如果 replica 太久沒通知 primary，primary 會透過這個 message 要求 replica 回覆
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
 			var pkm pglogrepl.PrimaryKeepaliveMessage
 			if pkm, err = pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:]); err == nil && pkm.ReplyRequested {
 				p.nextReportTime = time.Time{}
 			}
+		// 收到 wal data
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
 			if err != nil {
 				return change, err
 			}
+			// decode wal data，並將資料轉換成對應的 Change type
 			m, err := p.decoder.Decode(xld.WALData)
-			fmt.Println("m:", m)
 			if m == nil || err != nil {
 				return change, err
 			}
+			// change 是 insert, update, delete 類型
 			if msg := m.GetChange(); msg != nil {
-				fmt.Println("msg:", msg.New)
+				// ignore pgcapture schema 下的 sources table
+				// 原因在於 sources 是給下游的 PG 使用的
 				if decode.Ignore(msg) {
 					return change, nil
 				} else if decode.IsDDL(msg) {
-					fmt.Println("isDDL")
+					// 如果是 DDL，需要更新 schema
 					if err = p.schema.RefreshType(); err != nil {
 						return change, err
 					}
 				}
+				// 儲存 seq 是為了要當 source restart 的時候可以去比對正確的 LSN
+				// 因為 begin 跟 commit 之間的所有 LSN 會一樣，中間的差異是 seq
 				p.currentSeq++
 			} else if b := m.GetBegin(); b != nil {
 				p.currentLsn = b.FinalLsn
@@ -220,6 +237,7 @@ func (p *PGXSource) committedLSN() (lsn pglogrepl.LSN) {
 	return pglogrepl.LSN(atomic.LoadUint64(&p.ackLsn))
 }
 
+// 通知 primary replica 已經收到的 LSN，則 primary 可以清空該 LSN 之前的資料
 func (p *PGXSource) reportLSN(ctx context.Context) error {
 	if committed := p.committedLSN(); committed != 0 {
 		return pglogrepl.SendStandbyStatusUpdate(ctx, p.replConn, pglogrepl.StandbyStatusUpdate{WALWritePosition: committed})

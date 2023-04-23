@@ -46,19 +46,23 @@ func sourceToSink(src source.Source, sk sink.Sink) (err error) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
+	// 讓 restart 的時候可以從上次斷掉的 change 來繼續做
 	lastCheckPoint, err := sk.Setup()
 	if err != nil {
 		return err
 	}
 
+	// 這邊會從 sink 拿到的最新的紀錄，讓 source 開始拉資料
 	changes, err := src.Capture(lastCheckPoint)
 	if err != nil {
 		return err
 	}
 
 	go func() {
+		// 將 source 拉到的資料送到 sink
 		checkpoints := sk.Apply(changes)
 		for cp := range checkpoints {
+			// source 會紀錄 sink 讀取到哪裡了
 			src.Commit(cp)
 		}
 	}()

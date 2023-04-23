@@ -91,6 +91,7 @@ func (p *PGXSink) Setup() (cp cursor.Checkpoint, err error) {
 	p.pgSrcID = pgText(p.SourceID)
 	p.replLag = -1
 
+	// 透過 advisory lock 來防止重複 setup
 	var locked bool
 	if err := p.conn.QueryRow(ctx, "select pg_try_advisory_lock(('x' || md5(current_database()))::bit(64)::bigint)").Scan(&locked); err != nil {
 		return cp, err
@@ -107,6 +108,7 @@ func (p *PGXSink) Setup() (cp cursor.Checkpoint, err error) {
 		return cp, err
 	}
 
+	// cache schema 下的所有 relation
 	p.schema = decode.NewPGXSchemaLoader(p.conn)
 	if err = p.schema.RefreshKeys(); err != nil {
 		return cp, err
@@ -138,11 +140,15 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 	var str, ts string
 	var mid []byte
 	var seq uint32
+	// 撈取上次同步最新的 LSN, seq, mid (pulsar message id)
 	err = p.conn.QueryRow(ctx, "SELECT commit, seq, mid FROM pgcapture.sources WHERE id = $1 AND commit IS NOT NULL AND seq IS NOT NULL AND mid IS NOT NULL", p.SourceID).Scan(&str, &seq, &mid)
 	if err == pgx.ErrNoRows {
 		err = nil
 		if p.LogReader != nil {
 			p.log.Info("try to find last checkpoint from log reader")
+			// pg restart 會紀錄 redo done 哪個 LSN 及時間點
+			// "2021-03-01 16:25:02 UTC [1934-7] LOG:  redo done at AE28/49B135E8\n" +
+			// "2021-03-01 16:25:02 UTC [1934-8] LOG:  last completed transaction was at log time 2021-03-01 16:17:48.597172+00\n")
 			str, ts, err = ScanCheckpointFromLog(p.LogReader)
 		}
 	}
@@ -152,6 +158,7 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 		cp.LSN = uint64(l)
 		cp.Seq = seq
 	}
+	// 如果有 message id 可以直接用 message id 定位即可
 	if len(mid) != 0 {
 		cp.Data = mid
 		p.log.WithFields(logrus.Fields{
@@ -159,6 +166,7 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 			"MidHex":      hex.EncodeToString(mid),
 		}).Info("last checkpoint found")
 	} else if len(ts) != 0 {
+		// 利用 pg log 上次紀錄最新完成 transaction time 來快速定位 pulsar 的 message
 		var pts time.Time
 		if pts, err = time.Parse("2006-01-02 15:04:05.999999999Z07", ts); err == nil {
 			cp.Data = []byte(pts.Format(time.RFC3339Nano))
@@ -172,6 +180,7 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 		return cp, err
 	}
 
+	// 紀錄 sink 最新的 LSN
 	if cp.LSN != 0 {
 		p.prev = cp
 	}
@@ -191,6 +200,7 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 		}
 		switch msg := change.Message.Type.(type) {
 		case *pb.Message_Begin:
+			// 不應該在已經開啟 transaction 的情況下再次收到 begin
 			if p.inTX {
 				p.log.WithFields(logrus.Fields{
 					"MessageLSN": change.Checkpoint.LSN,
@@ -210,11 +220,11 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 				}).Warn("receive incomplete transaction: change")
 				break
 			}
-			fmt.Println("msg:", msg.Change.New)
+			// 判斷 change 的 schema 是否來自 pgcapture 以及 ddl_logs table
 			if decode.IsDDL(msg.Change) {
 				err = p.handleDDL(msg.Change)
-				fmt.Println("err:", err)
 			} else {
+				// 透過 skip 來檢查 mixed 的情況
 				if len(p.skip) != 0 && p.skip[fmt.Sprintf("%s.%s", msg.Change.Schema, msg.Change.Table)] {
 					p.log.WithFields(logrus.Fields{
 						"MessageLSN": change.Checkpoint.LSN,
@@ -232,6 +242,8 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 					"MidHex":     hex.EncodeToString(change.Checkpoint.Data),
 				}).Warn("receive incomplete transaction: commit")
 			} else {
+				// 除了 commit 收到的 change 還會加上 pgcapture.sources update 的操作
+				// 紀錄最新一筆的 commit LSN, seq, message id 等資訊
 				if err = p.handleCommit(change.Checkpoint, msg.Commit); err != nil {
 					break
 				}
@@ -280,7 +292,6 @@ func (p *PGXSink) handleDDL(m *pb.Change) (err error) {
 	if err != nil {
 		return err
 	}
-	fmt.Println("command: ", command)
 	if count == 0 {
 		return nil
 	}
@@ -340,7 +351,6 @@ parse:
 				relation = node.SelectStmt.IntoClause.Rel
 			}
 		}
-		fmt.Println("relation:", relation)
 		if relation == nil {
 			continue
 		}
@@ -556,6 +566,7 @@ func (p *PGXSink) handleCommit(cp cursor.Checkpoint, commit *pb.Commit) (err err
 	if _, err = p.conn.Exec(ctx, "commit"); err != nil {
 		return err
 	}
+	// 儲存這一次 commit 時間
 	atomic.StoreInt64(&p.replLag, time.Since(commitTs.Time).Milliseconds())
 	return
 }
