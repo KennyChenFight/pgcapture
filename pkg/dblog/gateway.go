@@ -21,17 +21,20 @@ type Gateway struct {
 	DumpInfoPuller DumpInfoPuller
 }
 
+// Capture consumer 透過 Capture 來拿對應 topic 的 message change
 func (s *Gateway) Capture(server pb.DBLogGateway_CaptureServer) error {
 	request, err := server.Recv()
 	if err != nil {
 		return err
 	}
 
+	// consumer 會傳 uri 來告訴 gateway 要從哪個 topic (也可以說是 db name) 拿 message change
 	init := request.GetInit()
 	if init == nil {
 		return ErrCaptureInitMessageRequired
 	}
 
+	// init 裡面可以設定 tableRegex 要吃哪些 table 的 message change
 	filter, err := tableRegexFromInit(init)
 	if err != nil {
 		return err
@@ -98,6 +101,7 @@ func (s *Gateway) capture(init *pb.CaptureInit, filter *regexp.Regexp, server pb
 	}
 	logger := logrus.WithFields(logrus.Fields{"URI": init.Uri, "From": "Gateway", "Peer": addr})
 
+	// pulsar src 會開始拿最新的 message change
 	changes, err := src.Capture(cursor.Checkpoint{})
 	if err != nil {
 		return err
@@ -124,7 +128,9 @@ func (s *Gateway) capture(init *pb.CaptureInit, filter *regexp.Regexp, server pb
 	logger.Infof("start capturing")
 
 	ongoingDumps := &dumpMap{m: make(map[uint32]DumpInfo, 2)}
+	// 收 consumer 丟過來的 ack (pulsar message change 或是 pg dump)
 	done := s.acknowledge(server, src, ongoingDumps)
+	// 跟 controller 拿對應 uri (db) 的 table 及其 page range
 	dumps := s.DumpInfoPuller.Pull(server.Context(), init.Uri)
 
 	lsn := uint64(0)
@@ -133,11 +139,13 @@ func (s *Gateway) capture(init *pb.CaptureInit, filter *regexp.Regexp, server pb
 		select {
 		case <-server.Context().Done():
 			return server.Context().Err()
+		// 聽上游的 pulsar 丟過來的 change
 		case msg, more := <-changes:
 			if !more {
 				return nil
 			}
 			if change := msg.Message.GetChange(); change != nil && (filter == nil || filter.MatchString(change.Table)) {
+				// 將 change 送給下游的 consumer
 				if err := server.Send(&pb.CaptureMessage{Checkpoint: &pb.Checkpoint{
 					Lsn:  msg.Checkpoint.LSN,
 					Seq:  msg.Checkpoint.Seq,
@@ -159,6 +167,7 @@ func (s *Gateway) capture(init *pb.CaptureInit, filter *regexp.Regexp, server pb
 			}
 			var dump []*pb.Change
 			if filter == nil || filter.MatchString(info.Resp.Table) {
+				// 跟 pg source 拿對應 page range 的資料
 				dump, err = dumper.LoadDump(lsn, info.Resp)
 				if err != nil {
 					logger.WithFields(logrus.Fields{"Dump": info.Resp.String()}).Errorf("dump error %v", err)
@@ -181,6 +190,7 @@ func (s *Gateway) capture(init *pb.CaptureInit, filter *regexp.Regexp, server pb
 				if i+1 == len(dump) {
 					isLast = []byte{1}
 				}
+				// 將 dump 送給下游的 consumer
 				if err = server.Send(&pb.CaptureMessage{Checkpoint: &pb.Checkpoint{
 					Lsn:  0,
 					Seq:  dumpID,

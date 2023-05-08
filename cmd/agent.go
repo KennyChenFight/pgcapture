@@ -176,6 +176,8 @@ func (a *Agent) pg2pulsar(params *structpb.Struct) (*pb.AgentConfigResponse, err
 	pgSrc := &source.PGXSource{SetupConnStr: v["PGConnURL"], ReplConnStr: v["PGReplURL"], ReplSlot: trimSlot(v["PulsarTopic"]), CreateSlot: true, StartLSN: v["StartLSN"]}
 	pulsarSink := &sink.PulsarSink{PulsarOption: pulsar.ClientOptions{URL: v["PulsarURL"]}, PulsarTopic: v["PulsarTopic"]}
 
+	// default pulsar tracker: reader (無法處理 geo replication 的 snapshot message)
+	// pulsar subscription tracker: subscription (開個 consumer 處理 geo replication 的 snapshot message)
 	switch v["PulsarTracker"] {
 	case "pulsar", "":
 		pulsarSink.SetupTracker = func(client pulsar.Client, topic string) (cursor.Tracker, error) {
@@ -204,6 +206,7 @@ func (a *Agent) pg2pulsar(params *structpb.Struct) (*pb.AgentConfigResponse, err
 	}
 
 	a.params = params
+	// report 目前的狀態
 	return a.report(a.params)
 }
 
@@ -223,6 +226,7 @@ func (a *Agent) pulsar2pg(params *structpb.Struct) (*pb.AgentConfigResponse, err
 		pgSink.LogReader = pgLog
 	}
 
+	// dumper 拿來 query pg sink 某一段 page 的資料
 	dumper, err := dblog.NewPGXSourceDumper(context.Background(), v["PGConnURL"])
 	if err != nil {
 		return nil, err
@@ -266,6 +270,7 @@ func (a *Agent) sourceToSink(src source.Source, sk sink.Sink) (err error) {
 			src.Commit(cp)
 		}
 	}()
+	// 定時檢查有無 error，有的話 stop source & sink
 	go func() {
 		check := func() bool {
 			a.mu.Lock()
@@ -307,8 +312,10 @@ func (a *Agent) report(params *structpb.Struct) (*pb.AgentConfigResponse, error)
 		return nil, fmt.Errorf("sinkErr: %v, sourceErr: %v", a.sinkErr, a.sourceErr)
 	}
 	if a.pgSink != nil {
+		// 紀錄 pg sink 的 replication lag => 每一次 sink 收到 commit change 的時候，會更新 replication lag
 		params.Fields["ReplicationLagMilliseconds"] = structpb.NewNumberValue(float64(a.pgSink.ReplicationLagMilliseconds()))
 	} else if a.pgSrc != nil {
+		// 紀錄 pg source 的 tx counter => 每一次 source 收到 commit change 的時候，會更新 tx counter
 		params.Fields["SourceTxCounter"] = structpb.NewNumberValue(float64(a.pgSrc.TxCounter()))
 	}
 	return &pb.AgentConfigResponse{Report: params}, nil

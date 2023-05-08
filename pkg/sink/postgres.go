@@ -566,7 +566,7 @@ func (p *PGXSink) handleCommit(cp cursor.Checkpoint, commit *pb.Commit) (err err
 	if _, err = p.conn.Exec(ctx, "commit"); err != nil {
 		return err
 	}
-	// 儲存這一次 commit 時間
+	// 儲存每一次當前時間與 commit 時間的差距
 	atomic.StoreInt64(&p.replLag, time.Since(commitTs.Time).Milliseconds())
 	return
 }

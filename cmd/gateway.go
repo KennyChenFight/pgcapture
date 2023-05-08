@@ -36,6 +36,7 @@ var gateway = &cobra.Command{
 			return err
 		}
 		gateway := &dblog.Gateway{
+			// resolver define gateway 所能控制的 pulsar topic 相關 config
 			SourceResolver: dblog.NewStaticAgentPulsarResolver(resolverConfig),
 			DumpInfoPuller: &dblog.GRPCDumpInfoPuller{Client: pb.NewDBLogControllerClient(controlConn)},
 		}
