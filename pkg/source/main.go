@@ -100,6 +100,7 @@ func (b *BaseSource) capture(readFn ReadFn, flushFn FlushFn) (chan Change, error
 				b.err.Store(fmt.Errorf("%w", err))
 				return
 			}
+			// 這邊會忽略 pgcapture.sources 的 message change
 			if change.Message != nil {
 				changes <- change
 			}
