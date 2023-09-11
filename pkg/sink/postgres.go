@@ -193,7 +193,7 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 
 func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 	var first bool
-	return p.BaseSink.apply(changes, func(change source.Change, committed chan cursor.Checkpoint) (err error) {
+	return p.BaseSink.apply(changes, func(sourceBufferSize int, change source.Change, committed chan cursor.Checkpoint) (err error) {
 		if !first {
 			p.log.WithFields(logrus.Fields{
 				"MessageLSN":  change.Checkpoint.LSN,
@@ -221,7 +221,7 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 				err = p.handleChange(msg.Change)
 			}
 		case *pb.Message_Commit:
-			if err = p.handleCommit(change.Checkpoint, msg.Commit, change); err != nil {
+			if err = p.handleCommit(sourceBufferSize, change, msg.Commit); err != nil {
 				break
 			}
 			p.skip = nil
@@ -543,7 +543,7 @@ const (
 	UpdateSourceSQL = "update pgcapture.sources set commit=$1,seq=$2,mid=$3,commit_ts=$4,apply_ts=now() where id=$5"
 )
 
-func (p *PGXSink) handleCommit(cp cursor.Checkpoint, commit *pb.Commit, change source.Change) (err error) {
+func (p *PGXSink) handleCommit(sourceBufferSize int, change source.Change, commit *pb.Commit) (err error) {
 	if err = p.flushInsert(); err != nil {
 		return err
 	}
@@ -556,6 +556,7 @@ func (p *PGXSink) handleCommit(cp cursor.Checkpoint, commit *pb.Commit, change s
 		id    []byte
 	)
 
+	cp := change.Checkpoint
 	// pgtype does not support uint64, so we have to encode it as text
 	cmt, err = p.conn.TypeMap().Encode(0, pgtype.TextFormatCode, pgLSN(cp.LSN), nil)
 	if err != nil {
@@ -582,7 +583,7 @@ func (p *PGXSink) handleCommit(cp cursor.Checkpoint, commit *pb.Commit, change s
 	p.currentCommit = commit
 	p.pendingCommitted = append(p.pendingCommitted, change.Checkpoint)
 
-	if len(p.pendingCommitted) == p.BatchTXSize || !change.HasNext {
+	if len(p.pendingCommitted) == p.BatchTXSize || sourceBufferSize == 0 {
 		err = p.endPipeline()
 	}
 	return

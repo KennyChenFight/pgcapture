@@ -1,8 +1,10 @@
 package sink
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	"fmt"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"log"
 	"os"
 	"strconv"
@@ -13,7 +15,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	. "github.com/onsi/gomega"
+	//. "github.com/onsi/gomega"
 	"github.com/rueian/pgcapture/internal/test"
 	"github.com/rueian/pgcapture/pkg/cursor"
 	"github.com/rueian/pgcapture/pkg/decode"
@@ -32,7 +34,7 @@ func newPGXSink(batchTXSize int) *PGXSink {
 }
 
 func TestPGXSink(t *testing.T) {
-	gomega := NewGomegaWithT(t)
+	//gomega := NewGomegaWithT(t)
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, test.GetPostgresURL())
 	if err != nil {
@@ -53,7 +55,8 @@ func TestPGXSink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sink := newPGXSink(3)
+	batchTxSize := 3
+	sink := newPGXSink(batchTxSize)
 
 	cp, err := sink.Setup()
 	if err != nil {
@@ -69,8 +72,8 @@ func TestPGXSink(t *testing.T) {
 		t.Fatalf("checkpoint of empty topic should be zero")
 	}
 
-	changes := make(chan source.Change)
-	committed := sink.Apply(changes)
+	changesSize := 10
+	changes := make(chan source.Change, changesSize)
 
 	lsn := uint64(0)
 	now := time.Now()
@@ -82,13 +85,13 @@ func TestPGXSink(t *testing.T) {
 	}
 
 	type task struct {
-		chs     []*pb.Change
-		verify  func(t *testing.T, changeCount int)
-		minVer  int64
-		hasNext bool
+		chs    []*pb.Change
+		verify func(t *testing.T, commitCheckpoint cursor.Checkpoint)
+		minVer int64
+		reset  func(t *testing.T)
 	}
 
-	doTx := func(opt task) {
+	doTx := func(opt task) (commitCheckpoint cursor.Checkpoint) {
 		if opt.minVer > pgVersion {
 			log.Printf("skip task due to pg version %d < %d", pgVersion, opt.minVer)
 			return
@@ -97,9 +100,8 @@ func TestPGXSink(t *testing.T) {
 		chs := opt.chs
 		now = now.Add(time.Second)
 		ts := now.Unix()*1000000 + int64(now.Nanosecond())/1000 - microsecFromUnixEpochToY2K
-		changeCount := 0
 		lsn++
-		changeCount++
+
 		changes <- source.Change{
 			Checkpoint: cursor.Checkpoint{LSN: lsn, Data: []byte(now.Format(time.RFC3339Nano))},
 			Message:    &pb.Message{Type: &pb.Message_Begin{Begin: &pb.Begin{}}},
@@ -107,7 +109,6 @@ func TestPGXSink(t *testing.T) {
 		for _, change := range chs {
 			now = now.Add(time.Second)
 			lsn++
-			changeCount++
 			changes <- source.Change{
 				Checkpoint: cursor.Checkpoint{LSN: lsn, Data: []byte(now.Format(time.RFC3339Nano))},
 				Message:    &pb.Message{Type: &pb.Message_Change{Change: change}},
@@ -115,15 +116,31 @@ func TestPGXSink(t *testing.T) {
 		}
 		now = now.Add(time.Second)
 		lsn++
-		changeCount++
+		commitCheckpoint = cursor.Checkpoint{LSN: lsn, Data: []byte(now.Format(time.RFC3339Nano))}
 		changes <- source.Change{
-			Checkpoint: cursor.Checkpoint{LSN: lsn, Data: []byte(now.Format(time.RFC3339Nano))},
+			Checkpoint: commitCheckpoint,
 			Message:    &pb.Message{Type: &pb.Message_Commit{Commit: &pb.Commit{CommitTime: uint64(ts)}}},
-			HasNext:    opt.hasNext,
 		}
 
 		if opt.verify != nil {
-			opt.verify(t, changeCount)
+			opt.verify(t, commitCheckpoint)
+		}
+		if opt.reset != nil {
+			opt.reset(t)
+		}
+		return
+	}
+
+	doTxs := func(tasks []task, verify func(t *testing.T, commitCheckpoints ...cursor.Checkpoint), reset func(t *testing.T)) {
+		var commitCheckpoints []cursor.Checkpoint
+		for _, task := range tasks {
+			commitCheckpoints = append(commitCheckpoints, doTx(task))
+		}
+		if verify != nil {
+			verify(t, commitCheckpoints...)
+		}
+		if reset != nil {
+			reset(t)
 		}
 	}
 
@@ -137,8 +154,9 @@ func TestPGXSink(t *testing.T) {
 				{Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE")}},
 			},
 		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+		verify: func(t *testing.T, commitCheckpoint cursor.Checkpoint) {
+			committed := sink.Apply(changes)
+			if cp := <-committed; cp.LSN != commitCheckpoint.LSN || !bytes.Equal(cp.Data, commitCheckpoint.Data) {
 				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
 			}
 			if err = sink.Error(); err != nil {
@@ -148,107 +166,173 @@ func TestPGXSink(t *testing.T) {
 				t.Fatalf("replicaition lag should not be -1")
 			}
 		},
-		hasNext: false,
+		reset: func(t *testing.T) {
+			if err = resetPGSink(sink, batchTxSize); err != nil {
+				t.Fatalf("reset sink failed: %v", err)
+			}
+			close(changes)
+			changes = make(chan source.Change, 100)
+		},
 	})
 
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_INSERT,
-			Schema: "public",
-			Table:  "t3",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			gomega.Eventually(func(g Gomega) {
-				g.Expect(committed).To(BeEmpty())
-			}).Should(Succeed())
+	tasks := []task{
+		{
+			chs: []*pb.Change{{
+				Op:     pb.Change_INSERT,
+				Schema: "public",
+				Table:  "t3",
+				New: []*pb.Field{
+					{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+					{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+					{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
+				},
+			}},
 		},
-		hasNext: true,
-	})
+		{
+			chs: []*pb.Change{{
+				Op:     pb.Change_UPDATE,
+				Schema: "public",
+				Table:  "t3",
+				New: []*pb.Field{
+					{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+					{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+					{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+				},
+			}},
+		},
+		{
+			chs: []*pb.Change{{
+				Op:     pb.Change_UPDATE,
+				Schema: "public",
+				Table:  "t3",
+				New: []*pb.Field{
+					{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 2}}},
+					{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 3}}},
+					{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+				},
+				Old: []*pb.Field{
+					{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+					{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+				},
+			}},
+		},
+	}
 
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t3",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			gomega.Eventually(func(g Gomega) {
-				g.Expect(committed).To(BeEmpty())
-			}).Should(Succeed())
-		},
-		hasNext: true,
-	})
+	doTxs(tasks, func(t *testing.T, commitCheckpoints ...cursor.Checkpoint) {
+		var traceBuffer bytes.Buffer
+		sink.raw.Frontend().Trace(&traceBuffer, pgproto3.TracerOptions{SuppressTimestamps: true})
+		committed := sink.Apply(changes)
+		for _, commitCheckpoint := range commitCheckpoints {
+			if cp := <-committed; cp.LSN != commitCheckpoint.LSN || !bytes.Equal(cp.Data, commitCheckpoint.Data) {
+				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+			}
+			if err = sink.Error(); err != nil {
+				t.Fatalf("unexpected %v", err)
+			}
+			if sink.ReplicationLagMilliseconds() == -1 {
+				t.Fatalf("replicaition lag should not be -1")
+			}
+		}
+		validatePipeline(t, &traceBuffer, validatePipelineOption{
+			expectedParseCount:    6,
+			expectedBindCount:     6,
+			expectedDescribeCount: 6,
+			expectedExecuteCount:  6,
+			expectedSyncCount:     1,
+		})
+	}, func(t *testing.T) {
+		if err := resetPGSink(sink, batchTxSize); err != nil {
+			t.Fatalf("reset sink failed: %v", err)
+		}
+		close(changes)
+		changes = make(chan source.Change, 100)
+	},
+	)
+
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_INSERT,
+	//		Schema: "public",
+	//		Table:  "t3",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
+	//		},
+	//	}},
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t3",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+	//		},
+	//	}},
+	//})
 
 	// test for
 	// 1. update with key changes
 	// 2. should flush pending committed when pending committed size is reached
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t3",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 2}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 3}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
-			},
-			Old: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			gomega.Eventually(func(g Gomega) {
-				g.Expect(committed).To(HaveLen(sink.BatchTXSize))
-			}).Should(Succeed())
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t3",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 2}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 3}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+	//		},
+	//		Old: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 1}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		for i := 0; i < changeCount; i++ {
+	//			offset := changeCount * (len(committed) - 1)
+	//			targetLSN := lsn - uint64(offset)
+	//			current := now
+	//			targetData := current.Add(-time.Duration(offset) * time.Second).Format(time.RFC3339Nano)
+	//			if cp := <-committed; cp.LSN != targetLSN || string(cp.Data) != targetData {
+	//				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//			}
+	//			if err = sink.Error(); err != nil {
+	//				t.Fatalf("unexpected %v", err)
+	//			}
+	//			if sink.ReplicationLagMilliseconds() == -1 {
+	//				t.Fatalf("replicaition lag should not be -1")
+	//			}
+	//		}
+	//
+	//		var f3 string
+	//		err := conn.QueryRow(ctx, "select f3 from t3 where f1 = $1 and f2 = $2", 2, 3).Scan(&f3)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		if f3 != "B" {
+	//			t.Fatalf("unexpected f3 %v", f3)
+	//		}
+	//
+	//		var count int
+	//		err = conn.QueryRow(ctx, "select count(1) from t3 where f1 = $1 and f2 = $2", 1, 1).Scan(&count)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		if count != 0 {
+	//			t.Fatalf("unexpected count %v", count)
+	//		}
+	//	},
+	//	hasNext: true,
+	//})
+	//
 
-			for i := 0; i < changeCount; i++ {
-				offset := changeCount * (len(committed) - 1)
-				targetLSN := lsn - uint64(offset)
-				current := now
-				targetData := current.Add(-time.Duration(offset) * time.Second).Format(time.RFC3339Nano)
-				if cp := <-committed; cp.LSN != targetLSN || string(cp.Data) != targetData {
-					t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-				}
-				if err = sink.Error(); err != nil {
-					t.Fatalf("unexpected %v", err)
-				}
-				if sink.ReplicationLagMilliseconds() == -1 {
-					t.Fatalf("replicaition lag should not be -1")
-				}
-			}
-
-			var f3 string
-			err := conn.QueryRow(ctx, "select f3 from t3 where f1 = $1 and f2 = $2", 2, 3).Scan(&f3)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if f3 != "B" {
-				t.Fatalf("unexpected f3 %v", f3)
-			}
-
-			var count int
-			err = conn.QueryRow(ctx, "select count(1) from t3 where f1 = $1 and f2 = $2", 1, 1).Scan(&count)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if count != 0 {
-				t.Fatalf("unexpected count %v", count)
-			}
-		},
-		hasNext: true,
-	})
-
+	committed := sink.Apply(changes)
 	// handle select create case
 	doTx(task{
 		chs: []*pb.Change{{
@@ -266,8 +350,8 @@ func TestPGXSink(t *testing.T) {
 				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'X'}}},
 			},
 		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+		verify: func(t *testing.T, commitCheckpoint cursor.Checkpoint) {
+			if cp := <-committed; cp.LSN != commitCheckpoint.LSN || !bytes.Equal(cp.Data, commitCheckpoint.Data) {
 				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
 			}
 			if err = sink.Error(); err != nil {
@@ -287,7 +371,6 @@ func TestPGXSink(t *testing.T) {
 				t.Fatalf("unexpected f3 %v", f3)
 			}
 		},
-		hasNext: false,
 	})
 
 	doTx(task{
@@ -300,7 +383,7 @@ func TestPGXSink(t *testing.T) {
 				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 3}}},
 			},
 		}},
-		verify: func(t *testing.T, changeCount int) {
+		verify: func(t *testing.T, commitCheckpoint cursor.Checkpoint) {
 			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
 				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
 			}
@@ -320,328 +403,380 @@ func TestPGXSink(t *testing.T) {
 				t.Fatalf("unexpected count %v", count)
 			}
 		},
-		hasNext: false,
 	})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_INSERT,
+	//		Schema: decode.ExtensionSchema,
+	//		Table:  decode.ExtensionDDLLogs,
+	//		New: []*pb.Field{
+	//			{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`create table t5 (f1 int generated always as identity primary key, f2 int, f3 text)`)}},
+	//			{Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE")}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//	},
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_INSERT,
+	//		Schema: "public",
+	//		Table:  "t5",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'D'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 string
+	//		)
+	//		// should override the system value for generated identity column f1
+	//		err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		if f2 != 20 || f3 != "D" {
+	//			t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
+	//		}
+	//	},
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t5",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 21}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'E'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 string
+	//		)
+	//		err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		if f2 != 21 || f3 != "E" {
+	//			t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
+	//		}
+	//	},
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t5",
+	//		Old: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 21}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'E'}}},
+	//		},
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 22}}},
+	//			{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'F'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 string
+	//		)
+	//		err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		if f2 != 22 || f3 != "F" {
+	//			t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
+	//		}
+	//	},
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_INSERT,
+	//		Schema: decode.ExtensionSchema,
+	//		Table:  decode.ExtensionDDLLogs,
+	//		New: []*pb.Field{
+	//			{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`create table t6 (f1 int generated always as identity primary key, f2 int, f3 int generated always as (f2 + 1) stored, f4 text)`)}},
+	//			{Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE")}},
+	//		},
+	//	}},
+	//	// the tests for the generated columns are only for pg12 or above
+	//	minVer: 120000,
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//	},
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_INSERT,
+	//		Schema: "public",
+	//		Table:  "t6",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
+	//			{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 int
+	//			f4 string
+	//		)
+	//		// should override the system value for generated identity column f1
+	//		err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		// should still get the generated value for f3
+	//		if f2 != 20 || f3 != 21 || f4 != "A" {
+	//			t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
+	//		}
+	//	},
+	//	minVer:  120000,
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t6",
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 30}}},
+	//			{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
+	//			{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 int
+	//			f4 string
+	//		)
+	//		// should override the system value for generated identity column f1
+	//		err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		// should still get the generated value for f3
+	//		if f2 != 30 || f3 != 31 || f4 != "B" {
+	//			t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
+	//		}
+	//	},
+	//	minVer:  120000,
+	//	hasNext: false,
+	//})
+	//
+	//doTx(task{
+	//	chs: []*pb.Change{{
+	//		Op:     pb.Change_UPDATE,
+	//		Schema: "public",
+	//		Table:  "t6",
+	//		Old: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 30}}},
+	//			{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 31}}},
+	//			{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
+	//		},
+	//		New: []*pb.Field{
+	//			{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
+	//			{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 40}}},
+	//			{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
+	//			{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'C'}}},
+	//		},
+	//	}},
+	//	verify: func(t *testing.T, changeCount int) {
+	//		if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//			fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
+	//			t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//		}
+	//		if err = sink.Error(); err != nil {
+	//			t.Fatalf("unexpected %v", err)
+	//		}
+	//		if sink.ReplicationLagMilliseconds() == -1 {
+	//			t.Fatalf("replicaition lag should not be -1")
+	//		}
+	//
+	//		var (
+	//			f2 int
+	//			f3 int
+	//			f4 string
+	//		)
+	//		// should override the system value for generated identity column f1
+	//		err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
+	//		if err != nil {
+	//			t.Fatal(err)
+	//		}
+	//		// should still get the generated value for f3
+	//		if f2 != 40 || f3 != 41 || f4 != "C" {
+	//			t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
+	//		}
+	//	},
+	//	minVer:  120000,
+	//	hasNext: false,
+	//})
+	//
+	//sink.Stop()
+	//
+	//// test restart checkpoint
+	//sink = newPGXSink(3)
+	//
+	//cp, err = sink.Setup()
+	//if err != nil {
+	//	t.Fatal(err)
+	//}
+	//if cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
+	//	t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	//}
+	//sink.Stop()
+}
 
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_INSERT,
-			Schema: decode.ExtensionSchema,
-			Table:  decode.ExtensionDDLLogs,
-			New: []*pb.Field{
-				{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`create table t5 (f1 int generated always as identity primary key, f2 int, f3 text)`)}},
-				{Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE")}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-		},
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_INSERT,
-			Schema: "public",
-			Table:  "t5",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'D'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 string
-			)
-			// should override the system value for generated identity column f1
-			err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if f2 != 20 || f3 != "D" {
-				t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
-			}
-		},
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t5",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 21}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'E'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 string
-			)
-			err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if f2 != 21 || f3 != "E" {
-				t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
-			}
-		},
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t5",
-			Old: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 21}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'E'}}},
-			},
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 22}}},
-				{Name: "f3", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'F'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 string
-			)
-			err := conn.QueryRow(ctx, "select f2, f3 from t5 where f1 = $1", 20).Scan(&f2, &f3)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if f2 != 22 || f3 != "F" {
-				t.Fatalf("unexpected value for (f2, f3): (%v, %v)", f2, f3)
-			}
-		},
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_INSERT,
-			Schema: decode.ExtensionSchema,
-			Table:  decode.ExtensionDDLLogs,
-			New: []*pb.Field{
-				{Name: "query", Value: &pb.Field_Binary{Binary: []byte(`create table t6 (f1 int generated always as identity primary key, f2 int, f3 int generated always as (f2 + 1) stored, f4 text)`)}},
-				{Name: "tags", Value: &pb.Field_Binary{Binary: tags("CREATE TABLE")}},
-			},
-		}},
-		// the tests for the generated columns are only for pg12 or above
-		minVer: 120000,
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-		},
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_INSERT,
-			Schema: "public",
-			Table:  "t6",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
-				{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'A'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 int
-				f4 string
-			)
-			// should override the system value for generated identity column f1
-			err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// should still get the generated value for f3
-			if f2 != 20 || f3 != 21 || f4 != "A" {
-				t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
-			}
-		},
-		minVer:  120000,
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t6",
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 30}}},
-				{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
-				{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 int
-				f4 string
-			)
-			// should override the system value for generated identity column f1
-			err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// should still get the generated value for f3
-			if f2 != 30 || f3 != 31 || f4 != "B" {
-				t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
-			}
-		},
-		minVer:  120000,
-		hasNext: false,
-	})
-
-	doTx(task{
-		chs: []*pb.Change{{
-			Op:     pb.Change_UPDATE,
-			Schema: "public",
-			Table:  "t6",
-			Old: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 30}}},
-				{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 31}}},
-				{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'B'}}},
-			},
-			New: []*pb.Field{
-				{Name: "f1", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 20}}},
-				{Name: "f2", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 40}}},
-				{Name: "f3", Oid: 23, Value: &pb.Field_Binary{Binary: []byte{0, 0, 0, 100}}},
-				{Name: "f4", Oid: 25, Value: &pb.Field_Binary{Binary: []byte{'C'}}},
-			},
-		}},
-		verify: func(t *testing.T, changeCount int) {
-			if cp := <-committed; cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-				fmt.Print(cp.LSN, lsn, cp.Data, now.Format(time.RFC3339Nano))
-				t.Fatalf("unexpected %v %v %v", cp, lsn, now)
-			}
-			if err = sink.Error(); err != nil {
-				t.Fatalf("unexpected %v", err)
-			}
-			if sink.ReplicationLagMilliseconds() == -1 {
-				t.Fatalf("replicaition lag should not be -1")
-			}
-
-			var (
-				f2 int
-				f3 int
-				f4 string
-			)
-			// should override the system value for generated identity column f1
-			err := conn.QueryRow(ctx, "select f2, f3, f4 from t6 where f1 = $1", 20).Scan(&f2, &f3, &f4)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// should still get the generated value for f3
-			if f2 != 40 || f3 != 41 || f4 != "C" {
-				t.Fatalf("unexpected value for (f2, f3, f4): (%v, %v, %v)", f2, f3, f4)
-			}
-		},
-		minVer:  120000,
-		hasNext: false,
-	})
-
-	sink.Stop()
-
-	// test restart checkpoint
-	sink = newPGXSink(3)
-
-	cp, err = sink.Setup()
-	if err != nil {
-		t.Fatal(err)
+func resetPGSink(sink *PGXSink, batchTxSize int) error {
+	if err := sink.Stop(); err != nil {
+		return err
 	}
-	if cp.LSN != lsn || string(cp.Data) != now.Format(time.RFC3339Nano) {
-		t.Fatalf("unexpected %v %v %v", cp, lsn, now)
+	*sink = *newPGXSink(batchTxSize)
+	if _, err := sink.Setup(); err != nil {
+		return err
 	}
-	sink.Stop()
+	return nil
+}
+
+type validatePipelineOption struct {
+	expectedParseCount    int
+	expectedBindCount     int
+	expectedDescribeCount int
+	expectedExecuteCount  int
+	expectedSyncCount     int
+}
+
+func validatePipeline(t *testing.T, buffer *bytes.Buffer, opt validatePipelineOption) {
+	scanner := bufio.NewScanner(buffer)
+	var parseCount, bindCount, describeCount, executeCount, syncCount int
+	for scanner.Scan() {
+		switch {
+		case strings.Contains(scanner.Text(), "F\tParse"):
+			parseCount++
+		case strings.Contains(scanner.Text(), "F\tBind"):
+			bindCount++
+		case strings.Contains(scanner.Text(), "F\tDescribe"):
+			describeCount++
+		case strings.Contains(scanner.Text(), "F\tExecute"):
+			executeCount++
+		case strings.Contains(scanner.Text(), "F\tSync"):
+			syncCount++
+		}
+	}
+	if parseCount != opt.expectedParseCount {
+		t.Fatalf("unexpected parse count %v", parseCount)
+	}
+	if bindCount != opt.expectedBindCount {
+		t.Fatalf("unexpected bind count %v", bindCount)
+	}
+	if describeCount != opt.expectedDescribeCount {
+		t.Fatalf("unexpected describe count %v", describeCount)
+	}
+	if executeCount != opt.expectedExecuteCount {
+		t.Fatalf("unexpected execute count %v", executeCount)
+	}
+	if syncCount != opt.expectedSyncCount {
+		t.Fatalf("unexpected sync count %v", syncCount)
+	}
 }
 
 func tags(v ...string) []byte {
