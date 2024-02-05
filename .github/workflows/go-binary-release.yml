@@ -1,26 +1,17 @@
-name: build-go-binary
+name: Main
 
-on:
-  release:
-    types: [created]
+on: push
 
 jobs:
-  build-go-binary:
+  build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, windows, darwin]
-        goarch: [amd64, arm64]
-        exclude:
-          - goarch: arm64
-            goos: windows
     steps:
-      - uses: actions/checkout@v3
-      - uses: wangyoucao577/go-release-action@v1.46
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Build
+        run: ./dockerbuild.sh
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          goos: ${{ matrix.goos }}
-          goarch: ${{ matrix.goarch }}
-          goversion: 1.20
-          binary_name: "pgcapture"
-          build_command: "./dockerbuild.sh"
+          files: ./bin/out/pgcapture
