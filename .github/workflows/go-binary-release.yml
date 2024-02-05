@@ -23,4 +23,4 @@ jobs:
           goarch: ${{ matrix.goarch }}
           goversion: 1.20
           binary_name: "pgcapture"
-          build_command: "make build"
+          build_command: "./dockerbuild.sh"
