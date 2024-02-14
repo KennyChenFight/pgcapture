@@ -1,8 +1,9 @@
 name: Go Binary Release
 
 on:
-  release:
-    types: [ created, edited]
+  push:
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: write
