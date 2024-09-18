@@ -22,6 +22,10 @@ func NewSimpleConsumer(ctx context.Context, src source.RequeueSource, option Con
 	return newConsumer(ctx, src, option)
 }
 
+func NewDBogGatewaySource(ctx context.Context, client pb.DBLogGatewayClient, option ConsumerOption) *DBLogGatewayConsumer {
+	return newDBogGatewaySource(ctx, client, option)
+}
+
 func newDBogGatewaySource(ctx context.Context, client pb.DBLogGatewayClient, option ConsumerOption) *DBLogGatewayConsumer {
 	parameters, _ := structpb.NewStruct(map[string]interface{}{})
 	if option.TableRegex != "" {
